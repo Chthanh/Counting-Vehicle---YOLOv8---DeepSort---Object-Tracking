@@ -1,65 +1,138 @@
-from deep_sort.deep_sort.tracker import Tracker as DeepSortTracker
-from deep_sort.tools import generate_detections as gdet
-from deep_sort.deep_sort import nn_matching
-from deep_sort.deep_sort.detection import Detection
+# vim: expandtab:ts=4:sw=4
+from __future__ import absolute_import
 import numpy as np
+from . import kalman_filter
+from . import linear_assignment
+from . import iou_matching
+from .track import Track
 
 
 class Tracker:
-    tracker = None
-    encoder = None
-    tracks = None
+    """
+    This is the multi-target tracker.
 
-    def __init__(self):
-        max_cosine_distance = 0.4
-        nn_budget = None
+    Parameters
+    ----------
+    metric : nn_matching.NearestNeighborDistanceMetric
+        A distance metric for measurement-to-track association.
+    max_age : int
+        Maximum number of missed misses before a track is deleted.
+    n_init : int
+        Number of consecutive detections before the track is confirmed. The
+        track state is set to `Deleted` if a miss occurs within the first
+        `n_init` frames.
 
-        encoder_model_filename = 'mars-small128.pb'
+    Attributes
+    ----------
+    metric : nn_matching.NearestNeighborDistanceMetric
+        The distance metric used for measurement to track association.
+    max_age : int
+        Maximum number of missed misses before a track is deleted.
+    n_init : int
+        Number of frames that a track remains in initialization phase.
+    kf : kalman_filter.KalmanFilter
+        A Kalman filter to filter target trajectories in image space.
+    tracks : List[Track]
+        The list of active tracks at the current time step.
 
-        metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
-        self.tracker = DeepSortTracker(metric)
-        self.encoder = gdet.create_box_encoder(encoder_model_filename, batch_size=1)
+    """
 
-    def update(self, frame, detections):
+    def __init__(self, metric, max_iou_distance=0.7, max_age=30, n_init=3):
+        self.metric = metric
+        self.max_iou_distance = max_iou_distance
+        self.max_age = max_age
+        self.n_init = n_init
 
-        if len(detections) == 0:
-            self.tracker.predict()
-            self.tracker.update([])
-            self.update_tracks()
-            return
+        self.kf = kalman_filter.KalmanFilter()
+        self.tracks = []
+        self._next_id = 1
 
-        bboxes = np.asarray([d[:-1] for d in detections])
-        bboxes[:, 2:] = bboxes[:, 2:] - bboxes[:, 0:2]
-        scores = [d[-1] for d in detections]
+    def predict(self):
+        """Propagate track state distributions one time step forward.
 
-        features = self.encoder(frame, bboxes)
+        This function should be called once every time step, before `update`.
+        """
+        for track in self.tracks:
+            track.predict(self.kf)
 
-        dets = []
-        for bbox_id, bbox in enumerate(bboxes):
-            dets.append(Detection(bbox, scores[bbox_id], features[bbox_id]))
+    def update(self, detections):
+        """Perform measurement update and track management.
 
-        self.tracker.predict()
-        self.tracker.update(dets)
-        self.update_tracks()
+        Parameters
+        ----------
+        detections : List[deep_sort.detection.Detection]
+            A list of detections at the current time step.
 
-    def update_tracks(self):
-        tracks = []
-        for track in self.tracker.tracks:
-            if not track.is_confirmed() or track.time_since_update > 1:
+        """
+        # Run matching cascade.
+        matches, unmatched_tracks, unmatched_detections = \
+            self._match(detections)
+
+        # Update track set.
+        for track_idx, detection_idx in matches:
+            self.tracks[track_idx].update(
+                self.kf, detections[detection_idx])
+        for track_idx in unmatched_tracks:
+            self.tracks[track_idx].mark_missed()
+        for detection_idx in unmatched_detections:
+            self._initiate_track(detections[detection_idx])
+        self.tracks = [t for t in self.tracks if not t.is_deleted()]
+
+        # Update distance metric.
+        active_targets = [t.track_id for t in self.tracks if t.is_confirmed()]
+        features, targets = [], []
+        for track in self.tracks:
+            if not track.is_confirmed():
                 continue
-            bbox = track.to_tlbr()
+            features += track.features
+            targets += [track.track_id for _ in track.features]
+            track.features = []
+        self.metric.partial_fit(
+            np.asarray(features), np.asarray(targets), active_targets)
 
-            id = track.track_id
+    def _match(self, detections):
 
-            tracks.append(Track(id, bbox))
+        def gated_metric(tracks, dets, track_indices, detection_indices):
+            features = np.array([dets[i].feature for i in detection_indices])
+            targets = np.array([tracks[i].track_id for i in track_indices])
+            cost_matrix = self.metric.distance(features, targets)
+            cost_matrix = linear_assignment.gate_cost_matrix(
+                self.kf, cost_matrix, tracks, dets, track_indices,
+                detection_indices)
 
-        self.tracks = tracks
+            return cost_matrix
 
+        # Split track set into confirmed and unconfirmed tracks.
+        confirmed_tracks = [
+            i for i, t in enumerate(self.tracks) if t.is_confirmed()]
+        unconfirmed_tracks = [
+            i for i, t in enumerate(self.tracks) if not t.is_confirmed()]
 
-class Track:
-    track_id = None
-    bbox = None
+        # Associate confirmed tracks using appearance features.
+        matches_a, unmatched_tracks_a, unmatched_detections = \
+            linear_assignment.matching_cascade(
+                gated_metric, self.metric.matching_threshold, self.max_age,
+                self.tracks, detections, confirmed_tracks)
 
-    def __init__(self, id, bbox):
-        self.track_id = id
-        self.bbox = bbox
+        # Associate remaining tracks together with unconfirmed tracks using IOU.
+        iou_track_candidates = unconfirmed_tracks + [
+            k for k in unmatched_tracks_a if
+            self.tracks[k].time_since_update == 1]
+        unmatched_tracks_a = [
+            k for k in unmatched_tracks_a if
+            self.tracks[k].time_since_update != 1]
+        matches_b, unmatched_tracks_b, unmatched_detections = \
+            linear_assignment.min_cost_matching(
+                iou_matching.iou_cost, self.max_iou_distance, self.tracks,
+                detections, iou_track_candidates, unmatched_detections)
+
+        matches = matches_a + matches_b
+        unmatched_tracks = list(set(unmatched_tracks_a + unmatched_tracks_b))
+        return matches, unmatched_tracks, unmatched_detections
+
+    def _initiate_track(self, detection):
+        mean, covariance = self.kf.initiate(detection.to_xyah())
+        self.tracks.append(Track(
+            mean, covariance, self._next_id, self.n_init, self.max_age,
+            detection.feature))
+        self._next_id += 1
