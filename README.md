@@ -1,5 +1,5 @@
 # Counting-Vehicle---YOLOv8---DeepSort---Object-Tracking
-This project for learning and deeper understanding for applying YOLOv8 and DeepSORT algorithm to track multiple vehicles. This project will help us count how many vehicles travel in a specific region. This project is using source code @computervisioneng. Source code DeepSORT algorithm and nano YOLOv8 model weights I downloaded from original repositories on github.
+This project for learning and deeper understanding for applying YOLOv8 and DeepSORT algorithm to track multiple vehicles. This project will help us count how many vehicles travel in a specific region. This project is using source code @computervisioneng. Source code DeepSORT algorithm and nano YOLOv8 model weights which I downloaded from original repositories on github.
 
 Result of this project:
 
